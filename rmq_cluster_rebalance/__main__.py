@@ -46,6 +46,8 @@ class Rebalance:
         self.args = args
         self.session = requests.Session()
         self.session.auth = (args.username, args.password)
+        self.queue = args.queue
+        self.to_node = args.node
         self.session.headers = {
             'User-Agent': 'rmq-cluster-rebalance/{}'.format(version)}
         self.session.mount('http://', ADAPTER)
@@ -61,19 +63,33 @@ class Rebalance:
 
     def run(self) -> typing.NoReturn:
         LOGGER.info('rmq-cluster-rebalance starting')
+        if self.queue != "" and self.to_node != "":
+            assign_to = self.to_node
+            queue = self._queue()
+            self._move(assign_to, queue)
+            return
         for queue in self._queues():
-            assign_to = self._node_assignment()
-            if assign_to == queue['node']:
-                LOGGER.info('Queue %s is already on %s, skipping',
-                            queue['name'], queue['node'])
-                self._advance_node()
+            queue_name = queue["name"]
+            if ".pidbox" in queue_name:
                 continue
-            LOGGER.info('Moving %s to %s', queue['name'], assign_to)
-            if assign_to not in queue.get('synchronised_slave_nodes', []):
-                self._apply_step1_policy(queue)
-            self._apply_step2_policy(queue, assign_to)
-            self._delete_policy()
+            assign_to = self._node_assignment()
+            self._move(assign_to, queue)
+
+    def _move(self, assign_to, queue):
+        if assign_to == queue['node']:
+            LOGGER.info('Queue %s is already on %s, skipping',
+                        queue['name'], queue['node'])
             self._advance_node()
+            return
+        # if queue['name'] in ["bookcourse.buses", "celery"]:
+        #     return
+        LOGGER.info('Moving %s to %s', queue['name'], assign_to)
+        if assign_to not in queue.get('synchronised_slave_nodes', []):
+            self._apply_step1_policy(queue)
+        self._apply_step2_policy(queue, assign_to)
+        self._apply_sync_policy(queue, assign_to)
+        self._delete_policy()
+        self._advance_node()
 
     def _advance_node(self) -> typing.NoReturn:
         self.node_offset += 1
@@ -100,8 +116,10 @@ class Rebalance:
     def _apply_step1_policy(self, queue: dict) -> typing.NoReturn:
         """Apply the policy to ensure HA is setup"""
         policy = self._remove_blacklisted_keys(
-            queue['effective_policy_definition'] or {})
+            # queue['effective_policy_definition'] or {})
+            queue.get('effective_policy_definition', {}))
         policy['ha-mode'] = 'all'
+        policy['ha-sync-mode'] = 'automatic'
         self._apply_policy(queue['name'], policy)
         self._wait_for_synchronized_slaves(queue['name'])
 
@@ -109,10 +127,25 @@ class Rebalance:
                             queue: dict,
                             destination: str) -> typing.NoReturn:
         """Apply the policy to move the master"""
-        policy = queue['effective_policy_definition'] or {}
+        # policy = queue['effective_policy_definition'] or {}
+        policy = queue.get('effective_policy_definition', {})
         self._remove_blacklisted_keys(policy)
         policy['ha-mode'] = 'nodes'
         policy['ha-params'] = [destination]
+        policy['ha-sync-mode'] = 'automatic'
+        self._apply_policy(queue['name'], policy)
+        self._wait_for_queue_move(queue['name'], destination)
+
+    def _apply_sync_policy(self,
+                           queue: dict,
+                           destination: str) -> typing.NoReturn:
+        """对指定queue auto sync"""
+        # policy = queue['effective_policy_definition'] or {}
+        policy = queue.get('effective_policy_definition', {})
+        self._remove_blacklisted_keys(policy)
+        policy['ha-mode'] = 'exactly'
+        policy['ha-params'] = 2
+        policy['ha-sync-mode'] = 'automatic'
         self._apply_policy(queue['name'], policy)
         self._wait_for_queue_move(queue['name'], destination)
 
@@ -171,7 +204,7 @@ class Rebalance:
             nodes = result.json()
             if not result.ok:
                 exit_application('Error looking up nodes: {}'.format(
-                   nodes['reason']), 6)
+                    nodes['reason']), 6)
             return [node['name'] for node in nodes]
 
     def _node_assignment(self) -> str:
@@ -193,9 +226,22 @@ class Rebalance:
             result = response.json()
             if not response.ok:
                 exit_application('Error getting queues: {}'.format(
-                   result['reason']), 7)
+                    result['reason']), 7)
             for queue in result:
                 yield queue
+
+    def _queue(self) -> typing.Generator[dict, None, None]:
+        try:
+            queue_info_url = self._build_url('/api/queues/{vhost}') + "/{}".format(self.queue)
+            response = self.session.get(queue_info_url)
+        except exceptions.ConnectionError as error:
+            exit_application('Error getting queues: {}'.format(error), 1)
+        else:
+            result = response.json()
+            if not response.ok:
+                exit_application('Error getting queues: {}'.format(
+                    result['reason']), 7)
+            return result
 
     def _wait_for_queue_move(self, name: str, node: str) -> typing.NoReturn:
         LOGGER.info('Waiting for %s to move to %s', name, node)
@@ -217,8 +263,8 @@ class Rebalance:
                          sorted(queue.get('slave_nodes', [])),
                          sorted(queue.get('synchronised_slave_nodes', [])))
             if (queue.get('slave_nodes') and
-                sorted(queue.get('slave_nodes', [])) == sorted(queue.get(
-                    'synchronised_slave_nodes', []))):
+                    sorted(queue.get('slave_nodes', [])) == sorted(queue.get(
+                        'synchronised_slave_nodes', []))):
                 break
             LOGGER.info('Sleeping for %i seconds while waiting HA sync',
                         SLEEP_DURATION)
@@ -301,6 +347,16 @@ def parse_cli_arguments(args: typing.Optional[list] = None) \
         default=os.environ.get('RABBITMQ_URL', 'http://localhost:15672'),
         help='The RabbitMQ Management API base URL')
 
+    parser.add_argument(
+        '--queue', metavar='QUEUE', nargs='?',
+        default=os.environ.get('QUEUE', ''),
+        help='move queue to node')
+
+    parser.add_argument(
+        '--node', metavar='NODE', nargs='?',
+        default=os.environ.get('NODE', ''),
+        help='move queue to node')
+
     return parser.parse_args(args)
 
 
@@ -310,3 +366,7 @@ def main() -> typing.NoReturn:  # pragma: nocover
     args = parse_cli_arguments()
     configure_logging(args)
     Rebalance(args).run()
+
+
+if __name__ == '__main__':
+    main()
