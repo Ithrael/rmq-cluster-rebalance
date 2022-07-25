@@ -366,7 +366,3 @@ def main() -> typing.NoReturn:  # pragma: nocover
     args = parse_cli_arguments()
     configure_logging(args)
     Rebalance(args).run()
-
-
-if __name__ == '__main__':
-    main()
